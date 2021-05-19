@@ -14,7 +14,7 @@ max_seq_len = 1000
 
 datafile = sys.argv[1]
 compound_iso_smiles = []
-df = pd.read_csv('data/davis' + datafile + '.csv')
+df = pd.read_csv('data/davis/' + datafile + '.csv')
 compound_iso_smiles += list(df['compound_iso_smiles'])
 compound_iso_smiles = set(compound_iso_smiles)
 smile_graph = {}
@@ -27,7 +27,7 @@ datasets = ['davis']
 for dataset in datasets:
     processed_data_file_train = 'data/processed/' + dataset + datafile + '.pt'
     if (not os.path.isfile(processed_data_file_train)):
-        df = pd.read_csv('data/davis' + datafile + '_align.csv')
+        df = pd.read_csv('data/davis/' + datafile + '.csv')
         train_drugs, train_prots, train_Y = list(df['compound_iso_smiles']), list(df['target_sequence']), list(
             df['affinity'])
         XT = [t for t in train_prots]
@@ -35,7 +35,7 @@ for dataset in datasets:
 
         # make data PyTorch Geometric ready
         print('preparing ', dataset + '_train.pt in pytorch format!')
-        train_data = TestbedDataset(root='data', dataset=dataset + datafile + '_align', xd=train_drugs, xt=train_prots,
+        train_data = TestbedDataset(root='data', dataset=dataset + datafile, xd=train_drugs, xt=train_prots,
                                     y=train_Y, smile_graph=smile_graph)
         print(processed_data_file_train, ' and have been created')
     else:
