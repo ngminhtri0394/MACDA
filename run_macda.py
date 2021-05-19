@@ -6,7 +6,6 @@ import torch
 from rdkit import Chem
 from tensorboardX import SummaryWriter
 from torch.autograd import Variable
-
 import mol_utils
 from algorithms.attention_sac import AttentionSAC
 from config.explainer import Args, Log
@@ -14,14 +13,14 @@ from mol_utils import preprocess, seq_cat
 from utils.buffer import ReplayBuffer
 from utils.env_wrappers import DummyVecEnv
 from utils.make_env import make_env
-
+from tqdm import tqdm, trange
 
 def make_parallel_env(original_drug_smile, original_target, Hyperparams, atoms_, model_to_explain, original_drug,
-                      original_target_aff, pred_aff, device):
+                      original_target_aff, pred_aff, device, cof):
     def get_env_fn(rank):
         def init_env():
             env = make_env(original_drug_smile, original_target, Hyperparams, atoms_, model_to_explain, original_drug,
-                           original_target_aff, pred_aff, device)
+                           original_target_aff, pred_aff, device, cof)
             return env
 
         return init_env
@@ -29,10 +28,11 @@ def make_parallel_env(original_drug_smile, original_target, Hyperparams, atoms_,
     return DummyVecEnv([get_env_fn(0)])
 
 
-def run(config, device):
-    model_dir = Path('./runs') / config.env_id / config.model_name
+def run(config):
+    device = torch.device('cuda:'+str(config.gpu) if torch.cuda.is_available() else 'cpu')
+    model_dir = Path('./runs') / config.store_result_dir
 
-    train_loader, train_drugs, train_Y = preprocess('davis_graphdta', None)
+    train_loader, train_drugs, train_Y = preprocess(config.dataset, config)
 
     print("number of data")
     print(len(train_loader))
@@ -58,23 +58,26 @@ def run(config, device):
 
         print('Run pair number ', str(it))
         Hyperparams = Args()
-        BasePath = './runs/dta/' + config.model_name
+        BasePath = './runs/' + config.store_result_dir
         writer = SummaryWriter(BasePath + '/plots')
-        episodes = 0
+
         original_drug_smile = train_drugs[it]
         original_target_aff = train_Y[it]
         original_drug = original_pair
         original_target = original_pair.target[0]
-        print('Target')
+
+        print('Original target:')
         print(original_target)
-        print('Target seq len')
-        print(len(original_target))
+        print('Original molecule:')
+        print(original_drug_smile)
+
         model_to_explain = mol_utils.get_graphdta_dgn().to(device)
         pred_aff, drug_original_encoding, prot_original_encoding = model_to_explain(original_drug.to(device),
                                                                                     seq_cat(original_target).to(device))
         atoms_ = np.unique(
             [x.GetSymbol() for x in Chem.MolFromSmiles(original_drug_smile).GetAtoms()]
         )
+        cof = [1.0, 0.05, 0.01, 0.05]
         env = make_parallel_env(original_drug_smile,
                                 original_target,
                                 Hyperparams,
@@ -83,7 +86,8 @@ def run(config, device):
                                 original_drug,
                                 original_target_aff,
                                 pred_aff,
-                                device)
+                                device,
+                                cof)
         model = AttentionSAC.init_from_env(env,
                                            tau=config.tau,
                                            pi_lr=config.pi_lr,
@@ -96,20 +100,19 @@ def run(config, device):
         replay_buffer = ReplayBuffer(config.buffer_length, model.nagents,
                                      [obsp[0] for obsp in env.observation_space],
                                      [acsp for acsp in env.action_space])
-        mol_utils.TopKCounterfactualsDTA.init(
-            original_drug_smile,
-            it,
-            BasePath + "/counterfacts"
-        )
+
+        if not os.path.isdir(BasePath + "/counterfacts"):
+            os.makedirs(BasePath + "/counterfacts")
+        mol_utils.TopKCounterfactualsDTA.init(original_drug_smile, it, BasePath + "/counterfacts")
+
         t = 0
-        for ep_i in range(0, config.n_episodes, config.n_rollout_threads):
-            print("Episodes %i-%i of %i" % (ep_i + 1,
-                                            ep_i + 1 + config.n_rollout_threads,
-                                            config.n_episodes))
+        episode_length = 1
+        trg = trange(0, config.n_episodes, config.n_rollout_threads)
+        for ep_i in trg:
             obs = env.reset()
             model.prep_rollouts(device='cpu')
 
-            for et_i in range(config.episode_length):
+            for et_i in range(episode_length):
                 # rearrange observations to be per agent, and convert to torch Variable
                 torch_obs = [Variable(torch.Tensor(np.vstack(obs[:, i])),
                                       requires_grad=False)
@@ -121,12 +124,13 @@ def run(config, device):
                 # rearrange actions to be per environment
                 actions = [[ac[i] for ac in agent_actions] for i in range(config.n_rollout_threads)]
                 next_obs, results, dones, action_drug, action_prot = env.step(actions)
-                drug_reward, loss_, gain, drug_sim, prot_sim = results[0][0]
-                prot_reward, loss_, gain, drug_sim, prot_sim = results[0][1]
+                drug_reward, loss_, gain, drug_sim, prot_sim, qed = results[0][0]
+                prot_reward, loss_, gain, drug_sim, prot_sim, qed = results[0][1]
 
                 writer.add_scalar('DTA/Reward', drug_reward, ep_i)
                 writer.add_scalar('DTA/Distance', loss_, ep_i)
                 writer.add_scalar('DTA/Drug Similarity', drug_sim, ep_i)
+                writer.add_scalar('DTA/Drug QED', qed, ep_i)
                 writer.add_scalar('DTA/Protein Similarity', prot_sim, ep_i)
 
                 pair_reward = []
@@ -150,13 +154,8 @@ def run(config, device):
                         model.update_all_targets()
                     model.prep_rollouts(device='cpu')
                 if np.all(dones == True):
-                    Log(
-                        f'Episode {ep_i}::Final Molecule Reward: {drug_reward:.6f} Final Protein Reward: {prot_reward:.6f} (loss: {loss_:.6f}, gain: {gain:.6f}, drug sim: {drug_sim:.6f}, protein sim: {prot_sim:.6f})')
-                    Log(f'Episode {ep_i}::Final Molecule: {action_drug}')
-                    Log(f'Episode {ep_i}::Final Protein: {action_prot}')
                     mutate_position = [i for i in range(len(original_target)) if original_target[i] != action_prot[i]]
-                    Log(f'Episode {ep_i}::Protein mutate position: {mutate_position}')
-
+                    trg.set_postfix(Reward=drug_reward, DrugSim=drug_sim, TargetSim=prot_sim, SMILES=action_drug, TargetMutatePosition=mutate_position, refresh=True)
                     mol_utils.TopKCounterfactualsDTA.insert({
                         'smiles': action_drug,
                         'protein': action_prot,
@@ -165,14 +164,15 @@ def run(config, device):
                         'loss': loss_,
                         'gain': gain,
                         'drug sim': drug_sim,
+                        'drug qed': qed,
                         'prot sim': prot_sim,
                         'mutate position': mutate_position
                     })
             ep_rews = replay_buffer.get_average_rewards(
-                config.episode_length * 1)
+                episode_length * 1)
             for a_i, a_ep_rew in enumerate(ep_rews):
                 logger.add_scalar('agent%i/mean_episode_rewards' % a_i,
-                                  a_ep_rew * config.episode_length, ep_i)
+                                  a_ep_rew * episode_length, ep_i)
 
             if ep_i % config.save_interval < config.n_rollout_threads:
                 model.prep_rollouts(device='cpu')
@@ -187,15 +187,13 @@ def run(config, device):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument("--env_id", default="dta", help="Name of environment")
-    parser.add_argument("--model_name",
-                        help="Name of directory to store " +
-                             "model/training contents", default="test_ABL1_MA_5")
+    parser.add_argument("--preprocessfile", default="davis_train_ABL1", help="Preprocessed file")
+    parser.add_argument("--dataset", default="davis_graphdta", help="Name of environment")
+    parser.add_argument("--store_result_dir", default="test_ABL1", help="Result storage dir")
+    parser.add_argument("--gpu", default=0, type=int)
     parser.add_argument("--n_rollout_threads", default=1, type=int)
     parser.add_argument("--buffer_length", default=int(1e6), type=int)
     parser.add_argument("--n_episodes", default=10000, type=int)
-    parser.add_argument("--episode_length", default=1, type=int)
     parser.add_argument("--steps_per_update", default=100, type=int)
     parser.add_argument("--num_updates", default=4, type=int,
                         help="Number of updates per update cycle")
@@ -215,4 +213,4 @@ if __name__ == '__main__':
 
     config = parser.parse_args()
 
-    run(config, device)
+    run(config)

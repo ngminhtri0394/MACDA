@@ -7,8 +7,7 @@ class MultiAgentDTAEnvs:
                  reward_callback,
                  done_callback,
                  reset_callback,
-                 Hyperparams,
-                 protein_seqlen):
+                 Hyperparams):
         self._envs = envs
         self.observation_callback = observation_callback
         self.reward_callback = reward_callback

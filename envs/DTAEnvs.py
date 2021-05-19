@@ -246,7 +246,10 @@ def _bond_addition(state, atoms_with_free_valence, allowed_ring_sizes,
             # When sanitization fails
             if sanitization_result:
                 continue
-            bond_addition.add(Chem.MolToSmiles(new_state))
+            try:
+                bond_addition.add(Chem.MolToSmiles(new_state))
+            except:
+                print('Error bond addtion')
     return bond_addition
 
 
@@ -529,9 +532,7 @@ class DTAEnvs(object):
             raise ValueError('This episode is terminated.')
         if drug_action not in self._valid_actions_drug:
             raise ValueError('Invalid drug action.')
-        # print(self._valid_actions_prot)
-        # print('action')
-        # print(action[1])
+
         if prot_action not in self._valid_actions_prot:
             raise ValueError('Invalid protein action.')
         self._state = [drug_action, prot_action]
@@ -540,12 +541,7 @@ class DTAEnvs(object):
         self._valid_actions_drug = self.get_valid_actions_drug(force_rebuild=True)
         self._valid_actions_prot = self.get_valid_actions_prot(force_rebuild=True)
         self._counter += 1
-        #
-        # result = Result(
-        #     state=self._state,
-        #     reward=self.reward(),
-        #     terminated=(self._counter >= self.max_steps) or self._goal_reached())
-        # return result
+
 
     def visualize_state(self, state=None, **kwargs):
         """Draws the molecule of the state.

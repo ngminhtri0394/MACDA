@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import mol_utils
-
+from rdkit.Chem import QED
 from config.explainer import Args
 from rdkit import Chem, DataStructs
 from envs import DTAEnvs
@@ -18,34 +18,33 @@ class CounterfactualDTAEnvs(DTAEnvs.DTAEnvs):
                  discount_factor,
                  target_aff,
                  device,
-                 similarity_set=None,
-                 weight_sim=None,
+                 cof,
                  similarity_measure="neural_encoding",
-                 cof_sim=[0.6, 0.2, 0.2],
                  **kwargs
                  ):
         super(CounterfactualDTAEnvs, self).__init__(**kwargs)
-        if weight_sim is None:
-            weight_sim = 0.8
+
         Hyperparams = Args()
         self.device = device
         self.fp_length = Hyperparams.fingerprint_length
         self.fp_radius = Hyperparams.fingerprint_radius
         self.discount_factor = discount_factor
         self.model_to_explain = model_to_explain
-        self.weight_sim = weight_sim
         self.target_aff = torch.FloatTensor([[target_aff]])
         self.orig_pred = original_prediction
         self.distance = lambda x,y: F.l1_loss(x,y).detach()
+        self.cof = cof
         self.base_loss = self.distance(self.orig_pred.cpu(), self.target_aff.cpu()).item()
         self.original_target = original_target
-        self.cof_sim = cof_sim
+        self.original_molecule = original_molecule
 
-        if similarity_measure == "rescaled_neural_encoding":
-            self.similarity = lambda x, y: rescaled_cosine_similarity(x,
-                                                                      y,
-                                                                      similarity_set)
-            self.drug_original_encoding = self.model_to_explain(original_molecule, self.original_target)[1]
+
+        if similarity_measure == "neural_encoding":
+            self.similarity = lambda x, y: cosine_similarity(x, y)
+            [seq_cat(t) for t in self.original_target]
+
+            _, self.drug_original_encoding, self.prot_original_encoding = self.model_to_explain(original_molecule.to(device), seq_cat(self.original_target).to(device))
+
         else:
             raise NotImplemented
     def reward(self, agent):
@@ -53,25 +52,32 @@ class CounterfactualDTAEnvs(DTAEnvs.DTAEnvs):
         target = self._state[1]
         if molecule is None or len(molecule.GetBonds()) == 0:
             return 0.0, 0.0, 0.0
-
+        new_mol_QED = QED.qed(molecule)
         molecule = mol_utils.mol_to_dta_pyg(molecule)
         # predict from pyg molecule and target
         pred, new_mol_encoding, new_prot_encoding = self.model_to_explain(molecule.to(self.device), seq_cat(target).to(self.device))
-        #cal sim between encoding of pyg molecule
+        pred_drug,_,_ = self.model_to_explain(molecule.to(self.device), seq_cat(self.original_target).to(self.device))
+        pred_prot,_,_ = self.model_to_explain(self.original_molecule.to(self.device), seq_cat(target).to(self.device))
+
+        #calculate sim between encoding of pyg molecule
         drug_sim = self.similarity(new_mol_encoding, self.drug_original_encoding)
-        prot_sim =  self.similarity(new_prot_encoding, self.prot_original_encoding)
+        prot_sim = self.similarity(new_prot_encoding, self.prot_original_encoding)
+
         loss = self.distance(pred.cpu(), self.orig_pred.cpu()).item()
+        drug_only_loss = self.distance(pred_drug.cpu(), self.orig_pred.cpu()).item()
+        prot_only_loss = self.distance(pred_prot.cpu(), self.orig_pred.cpu()).item()
+
         gain = torch.sign(
-            self.distance(pred.cpu(), self.target_aff.cpu()) - self.base_loss
+            self.orig_pred - pred
         ).item()
 
-        reward = gain * loss * self.cof_sim[0] + prot_sim * self.cof_sim[1] + drug_sim * self.cof_sim[2]
+        joint_loss = (loss * gain - drug_only_loss - prot_only_loss)
+
+        reward = joint_loss * self.cof[0] + drug_sim * self.cof[1] + prot_sim * self.cof[2]
 
         del molecule, pred, new_mol_encoding
         return reward * self.discount_factor \
-            ** (self.max_steps - self.num_steps_taken), loss, gain, drug_sim, prot_sim
-        # return reward * self.discount_factor \
-        #        ** (self.max_steps - self.num_steps_taken)
+            ** (self.max_steps - self.num_steps_taken), joint_loss, gain, drug_sim, prot_sim, new_mol_QED
 
     def observation(self, agent):
         if agent.type == 'protein':
